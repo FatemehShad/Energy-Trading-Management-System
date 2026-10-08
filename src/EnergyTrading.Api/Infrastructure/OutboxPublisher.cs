@@ -23,8 +23,8 @@ public sealed class OutboxPublisher(IServiceScopeFactory scopes, IConfiguration 
                 // PostgreSQL transaction lock keeps multiple API replicas from publishing concurrently.
                 await using var transaction = await db.Database.BeginTransactionAsync(stoppingToken);
                 await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock(724109)", stoppingToken);
-                var batch = await db.Outbox.Where(m => m.PublishedAt == null)
-                    .OrderBy(m => m.CreatedAt).Take(100).ToListAsync(stoppingToken);
+                // Only the earliest pending version of each trade is eligible, even if clocks move backwards.
+                var batch = await db.Outbox.PendingInOrder().Take(100).ToListAsync(stoppingToken);
                 foreach (var message in batch)
                 {
                     await producer.ProduceAsync(config["Kafka:Topic"] ?? "energy.trades.v1",

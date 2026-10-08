@@ -43,7 +43,9 @@ app.Use(async (context, next) =>
     catch (ArgumentException ex) { await Results.Problem(ex.Message, statusCode: 400).ExecuteAsync(context); }
     catch (DbUpdateConcurrencyException)
     { await Results.Problem("Trade changed concurrently; retry the request.", statusCode: 409).ExecuteAsync(context); }
-    catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+    catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "IX_Outbox_AggregateId_AggregateVersion" })
+    { await Results.Problem("Trade changed concurrently; retry the request.", statusCode: 409).ExecuteAsync(context); }
+    catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation, ConstraintName: "IX_Trades_ClientTradeId" })
     { await Results.Problem("ClientTradeId already exists.", statusCode: 409).ExecuteAsync(context); }
 });
 app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }));
@@ -76,28 +78,35 @@ app.MapGet("/api/positions", async (TradingDbContext db, string? portfolio, Canc
     var query = db.Trades.AsNoTracking().Where(t => t.Status == TradeStatus.Active);
     if (portfolio is not null) query = query.Where(t => t.Portfolio == portfolio);
     // Aggregate in PostgreSQL rather than loading the entire trade book.
-    return Results.Ok(await query.GroupBy(t => new { t.Portfolio, t.Product })
-        .OrderBy(g => g.Key.Portfolio).ThenBy(g => g.Key.Product)
+    return Results.Ok(await query.GroupBy(t => new { t.Portfolio, t.Product, t.Commodity, t.Currency, t.DeliveryStart, t.DeliveryEnd })
+        .OrderBy(g => g.Key.Portfolio).ThenBy(g => g.Key.Product).ThenBy(g => g.Key.Commodity).ThenBy(g => g.Key.Currency)
+        .ThenBy(g => g.Key.DeliveryStart).ThenBy(g => g.Key.DeliveryEnd)
         .Select(g => new Position(g.Key.Portfolio, g.Key.Product,
             g.Sum(t => (t.Side == TradeSide.Buy ? 1 : -1) * t.QuantityMwh),
-            g.Sum(t => (t.Side == TradeSide.Buy ? -1 : 1) * t.QuantityMwh * t.PricePerMwh)))
+            g.Sum(t => (t.Side == TradeSide.Buy ? -1 : 1) * t.QuantityMwh * t.PricePerMwh),
+            g.Key.Commodity, g.Key.Currency, g.Key.DeliveryStart, g.Key.DeliveryEnd))
         .ToListAsync(ct));
 });
 app.MapPost("/api/market-data", async (CreateQuote request, TradingDbContext db, CancellationToken ct) =>
 {
     TradingService.ValidateName(request.Product, "Product");
     TradingService.ValidatePrice(request.PricePerMwh);
+    TradingService.ValidateInstrument(request.Commodity, request.Currency);
     if (request.ObservedAt == default || request.ObservedAt.Offset != TimeSpan.Zero)
         throw new ArgumentException("ObservedAt must be a nonempty UTC timestamp.");
-    var quote = new MarketQuote { Product = request.Product, PricePerMwh = request.PricePerMwh, ObservedAt = request.ObservedAt };
+    var quote = new MarketQuote { Product = request.Product, Commodity = request.Commodity!.Value, Currency = request.Currency!, PricePerMwh = request.PricePerMwh, ObservedAt = request.ObservedAt };
     db.MarketQuotes.Add(quote);
     await db.SaveChangesAsync(ct);
     return Results.Created($"/api/market-data/{quote.Id}", quote);
 });
 app.MapGet("/api/market-data/{id:guid}", async (Guid id, TradingDbContext db, CancellationToken ct) =>
     await db.MarketQuotes.AsNoTracking().SingleOrDefaultAsync(q => q.Id == id, ct) is { } quote ? Results.Ok(quote) : Results.NotFound());
-app.MapGet("/api/market-data/latest", async (string product, TradingDbContext db, CancellationToken ct) =>
-    await db.MarketQuotes.AsNoTracking().Where(q => q.Product == product).OrderByDescending(q => q.ObservedAt)
-        .ThenBy(q => q.Id).FirstOrDefaultAsync(ct) is { } quote ? Results.Ok(quote) : Results.NotFound());
+app.MapGet("/api/market-data/latest", async (string product, Commodity? commodity, string? currency, TradingDbContext db, CancellationToken ct) =>
+{
+    TradingService.ValidateName(product, "Product");
+    TradingService.ValidateInstrument(commodity, currency);
+    return await db.MarketQuotes.AsNoTracking().Where(q => q.Product == product && q.Commodity == commodity && q.Currency == currency)
+        .OrderByDescending(q => q.ObservedAt).ThenBy(q => q.Id).FirstOrDefaultAsync(ct) is { } quote ? Results.Ok(quote) : Results.NotFound();
+});
 await app.RunAsync();
 public partial class Program { }

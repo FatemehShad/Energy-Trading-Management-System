@@ -1,6 +1,11 @@
 name: Deploy to AWS
 on:
   workflow_dispatch:
+    inputs:
+      maintenance_mode:
+        description: Stop API tasks before migration (required for the instrument/outbox upgrade)
+        type: boolean
+        default: true
 permissions:
   contents: read
   id-token: write
@@ -16,6 +21,7 @@ jobs:
       ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
       ECS_SERVICE: ${{ vars.ECS_SERVICE }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      MAINTENANCE_MODE: ${{ inputs.maintenance_mode }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -43,6 +49,12 @@ jobs:
           jq --arg image "$IMAGE" 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) | .containerDefinitions[0].image=$image' /tmp/task.json > /tmp/new-task.json
           TASK=$(aws ecs register-task-definition --cli-input-json file:///tmp/new-task.json --query taskDefinition.taskDefinitionArn --output text)
           jq '.services[0].networkConfiguration' /tmp/service.json > /tmp/network.json
+          if [ "$MAINTENANCE_MODE" = "true" ]; then
+            aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --desired-count 0 > /dev/null
+            aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > /tmp/stopped.json
+            jq -e '.services[0].runningCount == 0 and .services[0].pendingCount == 0' /tmp/stopped.json
+          fi
           aws ecs run-task --cluster "$ECS_CLUSTER" --launch-type FARGATE --task-definition "$TASK" --network-configuration file:///tmp/network.json --overrides '{"containerOverrides":[{"name":"api","command":["--migrate"]}]}' > /tmp/run.json
           jq -e '.failures | length == 0' /tmp/run.json
           MIGRATION=$(jq -r '.tasks[0].taskArn' /tmp/run.json)

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using EnergyTrading.Api.Domain;
 using EnergyTrading.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -12,7 +13,8 @@ public sealed class TradingService(TradingDbContext db)
         ValidateName(input.ClientTradeId, "ClientTradeId");
         ValidateName(input.Portfolio, "Portfolio");
         ValidateName(input.Product, "Product");
-        if (!Enum.IsDefined(input.Side)) throw new ArgumentException("Side must be Buy or Sell.");
+        ValidateInstrument(input.Commodity, input.Currency);
+        if (input.Side is null || !Enum.IsDefined(input.Side.Value)) throw new ArgumentException("Side must be Buy or Sell.");
         if (input.QuantityMwh <= 0 || input.QuantityMwh > 1_000_000_000m || decimal.Round(input.QuantityMwh, 6) != input.QuantityMwh)
             throw new ArgumentException("QuantityMwh must be positive, at most 1 billion, with at most six decimals.");
         ValidatePrice(input.PricePerMwh);
@@ -26,6 +28,13 @@ public sealed class TradingService(TradingDbContext db)
         if (string.IsNullOrWhiteSpace(value) || value.Length > 100 || value != value.Trim())
             throw new ArgumentException($"{name} must contain 1–100 characters without surrounding whitespace.");
     }
+    public static void ValidateInstrument(Commodity? commodity, string? currency)
+    {
+        if (commodity is null || commodity == Commodity.Unknown || !Enum.IsDefined(commodity.Value))
+            throw new ArgumentException("Commodity must be Electricity or Gas.");
+        if (currency is null || currency.Length != 3 || currency.Any(c => c < 'A' || c > 'Z'))
+            throw new ArgumentException("Currency must be a three-letter uppercase currency code, e.g. EUR or USD.");
+    }
     public static void ValidatePrice(decimal price)
     {
         // Negative electricity prices are valid.
@@ -36,7 +45,7 @@ public sealed class TradingService(TradingDbContext db)
     {
         Validate(input);
         var trade = new Trade { ClientTradeId = input.ClientTradeId, Portfolio = input.Portfolio,
-            Product = input.Product, Side = input.Side, QuantityMwh = input.QuantityMwh,
+            Product = input.Product, Commodity = input.Commodity!.Value, Currency = input.Currency!, Side = input.Side!.Value, QuantityMwh = input.QuantityMwh,
             PricePerMwh = input.PricePerMwh, DeliveryStart = input.DeliveryStart,
             DeliveryEnd = input.DeliveryEnd };
         db.Trades.Add(trade);
@@ -56,16 +65,22 @@ public sealed class TradingService(TradingDbContext db)
     }
     private void AddEvent(string type, Trade trade)
     {
-        var message = new OutboxMessage { AggregateId = trade.Id };
+        var message = new OutboxMessage { AggregateId = trade.Id, AggregateVersion = trade.Status == TradeStatus.Active ? 1 : 2 };
         message.Payload = JsonSerializer.Serialize(new { eventId = message.Id, eventType = type,
-            schemaVersion = 1, occurredAt = message.CreatedAt, trade });
+            schemaVersion = 2, aggregateVersion = message.AggregateVersion, occurredAt = message.CreatedAt, trade }, EventJson);
         db.Outbox.Add(message);
     }
+    private static readonly JsonSerializerOptions EventJson = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() }
+    };
     public static IReadOnlyList<Position> CalculatePositions(IEnumerable<Trade> trades) => trades
         .Where(t => t.Status == TradeStatus.Active)
-        .GroupBy(t => new { t.Portfolio, t.Product })
+        .GroupBy(t => new { t.Portfolio, t.Product, t.Commodity, t.Currency, t.DeliveryStart, t.DeliveryEnd })
         .Select(g => new Position(g.Key.Portfolio, g.Key.Product,
             g.Sum(t => (t.Side == TradeSide.Buy ? 1 : -1) * t.QuantityMwh),
-            g.Sum(t => (t.Side == TradeSide.Buy ? -1 : 1) * t.QuantityMwh * t.PricePerMwh)))
-        .OrderBy(p => p.Portfolio).ThenBy(p => p.Product).ToList();
+            g.Sum(t => (t.Side == TradeSide.Buy ? -1 : 1) * t.QuantityMwh * t.PricePerMwh),
+            g.Key.Commodity, g.Key.Currency, g.Key.DeliveryStart, g.Key.DeliveryEnd))
+        .OrderBy(p => p.Portfolio).ThenBy(p => p.Product).ThenBy(p => p.Commodity).ThenBy(p => p.Currency)
+        .ThenBy(p => p.DeliveryStart).ThenBy(p => p.DeliveryEnd).ToList();
 }
