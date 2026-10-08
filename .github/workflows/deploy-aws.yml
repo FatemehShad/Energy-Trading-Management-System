@@ -1,0 +1,55 @@
+name: Deploy to AWS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: aws-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet test -c Release --filter FullyQualifiedName~TradingTests
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push immutable image
+        run: |
+          IMAGE="$ECR_REPOSITORY:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Migrate and deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > /tmp/service.json
+          CURRENT=$(jq -r '.services[0].taskDefinition' /tmp/service.json)
+          aws ecs describe-task-definition --task-definition "$CURRENT" --query taskDefinition > /tmp/task.json
+          jq --arg image "$IMAGE" 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) | .containerDefinitions[0].image=$image' /tmp/task.json > /tmp/new-task.json
+          TASK=$(aws ecs register-task-definition --cli-input-json file:///tmp/new-task.json --query taskDefinition.taskDefinitionArn --output text)
+          jq '.services[0].networkConfiguration' /tmp/service.json > /tmp/network.json
+          aws ecs run-task --cluster "$ECS_CLUSTER" --launch-type FARGATE --task-definition "$TASK" --network-configuration file:///tmp/network.json --overrides '{"containerOverrides":[{"name":"api","command":["--migrate"]}]}' > /tmp/run.json
+          jq -e '.failures | length == 0' /tmp/run.json
+          MIGRATION=$(jq -r '.tasks[0].taskArn' /tmp/run.json)
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$MIGRATION"
+          aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$MIGRATION" > /tmp/result.json
+          jq -e '.tasks[0].containers[0].exitCode == 0' /tmp/result.json
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$TASK" --desired-count 1 > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" > /tmp/deployed.json
+          jq -e --arg task "$TASK" '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition == $task and .rolloutState == "COMPLETED"' /tmp/deployed.json
